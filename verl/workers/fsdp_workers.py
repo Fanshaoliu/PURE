@@ -1471,9 +1471,21 @@ class ProcessRewardModelWorker(Worker):
             gather_outpus_and_unpad,
             ulysses_pad_and_slice_inputs,
         )
+
+        import torch.distributed as dist
+        # === Debug 开关 ===
+        # 建议只在 rank 0 打印，且只打印少量数据
+        debug_print = self.config.actor.get('debug_print', False)
+        if dist.is_initialized():
+            if dist.get_rank() == 0:
+                debug_print = True
+        else:
+            debug_print = True
+        # =================
         
         response_length = micro_batch['responses'].size(-1)
 
+        # ================== 1. PRM 模型推理 (保持不变) ==================
         with torch.no_grad(), torch.autocast(device_type='cuda', dtype=torch.bfloat16):
             input_ids = micro_batch['input_ids']
             batch, seqlen = input_ids.shape
@@ -1523,19 +1535,169 @@ class ProcessRewardModelWorker(Worker):
                                                     position_ids=position_ids)
                 rm_score = output.logits  # (batch_size, seq_len, 2)
         
+        # ================== 2. 计算基础 Token Reward ==================
+
         rm_score = rm_score[:, -response_length:]
         rm_score = rm_score.softmax(dim=-1)
+        # PURE 基础打分: (P_correct - P_incorrect)
         rm_score = (rm_score[..., 1] - rm_score[..., 0]) * reward_mask  # (batch_size, seq_len)
+
+        # [Debug] 保存一份聚合前的原始分数用于对比
+        raw_rm_score_debug = rm_score.clone() if debug_print else None
+
+        # ================== 3. Progress Step 聚合与随机切分 (新增逻辑) ==================
+        # 检查是否需要进行 Progress Step 聚合
+        # 假设 config 中添加了相关配置
+        use_progress_aggregation = self.config.actor.get('use_progress_aggregation', False)
+        progress_agg_method = self.config.actor.get('progress_agg_method', 'min')
+        # 随机切分参数
+        MIN_STEP_SIZE = self.config.actor.get('min_step_size', 2)  # 每个 Progress 至少包含的原子步数
+        MAX_PROGRESS = self.config.actor.get('max_progress', 5)    # 最大 Progress 数量
+        # 用于Debug的变量
+        debug_score_ids = None
+        debug_generated_indices = None
         
+        if use_progress_aggregation:
+            score_ids = micro_batch['score_ids']
+            debug_score_ids = score_ids # 记录用于打印
+
+            # Case A: 数据中自带了分组信息
+            if 'progress_step_indices' in micro_batch:
+                progress_indices = micro_batch['progress_step_indices']
+            # Case B: 数据中没有分组信息 -> 执行随机切分
+            else:
+                batch_size = score_ids.size(0)
+                generated_indices_list = []
+                max_len = 0
+                
+                for b in range(batch_size):
+                    # 1. 计算当前样本的总步数 (score_ids != -1 的数量)
+                    valid_steps_count = (score_ids[b] != -1).sum().item()
+                    
+                    # 2. 确定切分逻辑
+                    p_indices = []
+                    if valid_steps_count < MIN_STEP_SIZE:
+                        # 步数太少，无法切分，直接作为一个整体
+                        p_indices = [valid_steps_count]
+                    else:
+                        # 计算最大允许切成几段
+                        max_partitions = min(MAX_PROGRESS, valid_steps_count // MIN_STEP_SIZE)
+                        if max_partitions < 1:
+                            p_indices = [valid_steps_count]
+                        else:
+                            # 随机决定切成 k 段
+                            k = torch.randint(1, max_partitions + 1, (1,)).item()
+                            
+                            current_step = 0
+                            steps_remaining = valid_steps_count
+                            
+                            # 生成前 k-1 个切点
+                            for i in range(k - 1):
+                                # 剩余的空间必须足够剩下的 partitions 分配
+                                # max_step_for_this = steps_remaining - (remaining_partitions * min_size)
+                                max_step_size = steps_remaining - (k - 1 - i) * MIN_STEP_SIZE
+                                
+                                # 在 [2, max_step_size] 之间随机选一个长度
+                                step_size = torch.randint(MIN_STEP_SIZE, max_step_size + 1, (1,)).item()
+                                
+                                current_step += step_size
+                                p_indices.append(current_step)
+                                steps_remaining -= step_size
+                            
+                            # 最后一个切点一定是总步数
+                            p_indices.append(valid_steps_count)
+                    
+                    generated_indices_list.append(p_indices)
+                    max_len = max(max_len, len(p_indices))
+                
+                debug_generated_indices = generated_indices_list # 记录用于打印
+
+                # 3. 构建 Tensor 并 Padding (填0，因为 logical index 是 1-based，0表示无效)
+                progress_indices = torch.zeros((batch_size, max_len), dtype=torch.long, device=rm_score.device)
+                for b, idx_list in enumerate(generated_indices_list):
+                    progress_indices[b, :len(idx_list)] = torch.tensor(idx_list, device=rm_score.device)
+
+            # 执行聚合：计算 Progress Reward 并重置 reward_mask
+            rm_score, reward_mask = self._aggregate_progress_rewards(
+                rm_score, 
+                reward_mask, 
+                score_ids, 
+                progress_indices, 
+                method=progress_agg_method
+            )
+
+        # ================== 4. Approximate Min-Form Credit Assignment ==================
         if not self.disable_approx_min_form_credit_assignment:
+            # 注意：此时 reward_mask 已经被 _aggregate_progress_rewards 稀疏化了
+            # 只有在 Progress Step 的边界处为 True，因此 Softmax 只会在这些节点间分配权重
             weight = torch.softmax(
                 -rm_score.masked_fill(
                     ~reward_mask, float('inf')
                 ) / self.temperature,
                 dim=-1,
             )
+            debug_weight = weight if debug_print else None # 记录用于打印
             rm_score *= weight
-        
+
+        # ================== [DEBUG PRINT BLOCK] ==================
+        if debug_print and use_progress_aggregation:
+            print("\n" + "="*30 + " PURE Progress Debug " + "="*30)
+            # 只查看 Batch 中的第一个样本
+            b = 0 
+            
+            # 1. 打印切分详情
+            if debug_score_ids is not None:
+                # 获取原子步骤的物理位置索引
+                valid_locs = debug_score_ids[b]
+                valid_locs = valid_locs[valid_locs != -1]
+                total_steps = len(valid_locs)
+                print(f"[Sample 0] Total Atomic Steps: {total_steps}")
+                
+                if debug_generated_indices:
+                    partitions = debug_generated_indices[b]
+                    print(f"[Sample 0] Random Partitions (Logical Indices): {partitions}")
+                    # 计算每段长度
+                    lengths = []
+                    prev = 0
+                    for p in partitions:
+                        lengths.append(p - prev)
+                        prev = p
+                    print(f"[Sample 0] Segment Lengths: {lengths}")
+
+            # 2. 打印分数对比
+            if raw_rm_score_debug is not None:
+                # 提取原始原子步骤分数
+                raw_step_scores = raw_rm_score_debug[b, valid_locs].detach().float().cpu().numpy()
+                print(f"[Sample 0] Raw Step Scores ({len(raw_step_scores)}):")
+                print(f"   {['{:.4f}'.format(x) for x in raw_step_scores]}")
+                
+                # 提取聚合后的 Progress 分数
+                # 我们通过 reward_mask 找到聚合后的非零位置
+                agg_mask = reward_mask[b].bool()
+                agg_locs = torch.nonzero(agg_mask).squeeze(-1)
+                agg_scores = rm_score[b, agg_locs].detach().float().cpu().numpy() # 注意：这里是已经乘过 weight 后的最终分数
+                
+                # 为了看清楚聚合效果，我们需要还原未乘 weight 的聚合分数
+                # 如果 weight 接近 0，还原可能会不稳定，所以这里我们重新去 rm_score (在乘 weight 之前的值很难获取，
+                # 除非我们在上面存临时变量。这里为了简单，我们打印 weight 和 最终 score)
+                
+                print(f"[Sample 0] Progress Step Locs (Physical): {agg_locs.cpu().tolist()}")
+                
+                if debug_weight is not None:
+                    progress_weights = debug_weight[b, agg_locs].detach().float().cpu().numpy()
+                    print(f"[Sample 0] Softmax Weights (Approx Min):")
+                    print(f"   {['{:.4f}'.format(x) for x in progress_weights]}")
+                    
+                    # 反推聚合后的原始分数 (Approximation)
+                    # Final = Agg * Weight => Agg = Final / Weight (仅供参考，Weight可能极小)
+                    # 更好的方式是在乘 weight 之前就 print，但为了不破坏代码结构，这里主要看 Weight 分布
+                    
+                print(f"[Sample 0] Final Weighted Rewards:")
+                print(f"   {['{:.4f}'.format(x) for x in agg_scores]}")
+                
+            print("="*80 + "\n")
+            # =========================================================
+
         return rm_score
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
@@ -1592,3 +1754,80 @@ class ProcessRewardModelWorker(Worker):
         output = output.to('cpu')
         torch.cuda.empty_cache()
         return output
+
+    def _aggregate_progress_rewards(self, rm_score, reward_mask, score_ids, progress_indices, method='mean'):
+        """
+        rm_score: [batch, seq_len] - Token level scores
+        reward_mask: [batch, seq_len] - True at step boundaries
+        score_ids: [batch, max_steps] - Physical token indices of step boundaries
+        progress_indices: [batch, max_progress_steps] - Logical step indices (1-based) ending each progress step
+        method: 'mean', 'min', 'sum', 'product'
+        """
+        batch_size = rm_score.size(0)
+        
+        # 创建新的稀疏 Reward 和 Mask
+        new_rm_score = torch.zeros_like(rm_score)
+        new_reward_mask = torch.zeros_like(reward_mask)
+        
+        # 遍历 Batch (由于逻辑比较复杂，这里使用循环，性能影响在Micro-batch下可控)
+        for b in range(batch_size):
+            # 1. 获取该样本所有 Step 的物理 Token 位置
+            # score_ids 中 -1 是 Padding，我们只取有效的
+            valid_step_locs = score_ids[b]
+            valid_step_locs = valid_step_locs[valid_step_locs != -1] # shape: [total_steps]
+            
+            if len(valid_step_locs) == 0:
+                continue
+
+            # 获取该样本所有 Step 的原始分数
+            # 注意：rm_score 在非 step 位置是 0，我们直接按索引取值
+            step_scores = rm_score[b, valid_step_locs] # shape: [total_steps]
+            
+            # 2. 获取 Progress 分组边界
+            # progress_indices 也是 padded 的 (假设用 0 或 -1 pad，这里假设有效值为 > 0)
+            p_indices = progress_indices[b]
+            p_indices = p_indices[p_indices > 0] # e.g., [3, 8, 10]
+            
+            start_step_idx = 0
+            
+            for end_step_idx in p_indices:
+                end_step_idx = int(end_step_idx.item())
+                
+                # 安全检查：如果索引越界（比如生成截断导致步数不够），则停止
+                if end_step_idx > len(step_scores):
+                    break
+                
+                # 3. 截取当前 Progress Step 内的所有原子 Step 分数
+                # 这里的切片是逻辑 Step 的切片
+                current_group_scores = step_scores[start_step_idx : end_step_idx]
+                
+                if len(current_group_scores) == 0:
+                    start_step_idx = end_step_idx
+                    continue
+
+                # 4. 聚合计算
+                if method == 'mean':
+                    agg_score = current_group_scores.mean()
+                elif method == 'sum':
+                    agg_score = current_group_scores.sum()
+                elif method == 'min':
+                    agg_score = current_group_scores.min()
+                elif method == 'product':
+                    # 注意：Reward 是 [-1, 1] 的 centered score。
+                    # Product 对负数可能产生不直观的结果（如负负得正），请根据业务确认是否需要先转概率
+                    agg_score = current_group_scores.prod()
+                else:
+                    raise ValueError(f"Unknown aggregation method: {method}")
+                
+                # 5. 将聚合分数写回张量
+                # 我们将其放置在当前 Progress Step 的**最后一个原子 Step** 的物理位置
+                # 这样保持了时序的因果性
+                last_step_physical_idx = valid_step_locs[end_step_idx - 1]
+                
+                new_rm_score[b, last_step_physical_idx] = agg_score
+                new_reward_mask[b, last_step_physical_idx] = True
+                
+                # 更新起点，准备下一个 Progress Step
+                start_step_idx = end_step_idx
+                
+        return new_rm_score, new_reward_mask
