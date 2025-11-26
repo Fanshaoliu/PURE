@@ -16,7 +16,7 @@ Note that we don't combine the main with ray_trainer as ray_trainer is used by o
 """
 import hydra
 import ray
-
+import logging
 from verl.trainer.ppo.ray_trainer import RayPPOTrainer
 
 
@@ -40,7 +40,11 @@ def run_ppo(config, compute_score=None):
                 }
             },
             # debug mode
-            local_mode=config.trainer.get('debug', False),
+            local_mode=config.trainer.get('debug_mode', False),
+            # 关键：设置全局日志级别为FATAL（仅保留致命错误）
+            # logging_level=logging.FATAL,
+            # # 可选：禁用日志输出到驱动端（进一步减少冗余）
+            # log_to_driver=False,
         )
 
     ray.get(main_task.remote(config, compute_score))
