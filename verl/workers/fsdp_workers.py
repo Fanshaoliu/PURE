@@ -1475,18 +1475,18 @@ class ProcessRewardModelWorker(Worker):
         import torch.distributed as dist
         # === Debug 开关 ===
         # 建议只在 rank 0 打印，且只打印少量数据
-        debug_print = self.config.get('debug_print', False)
         if dist.is_initialized():
             if dist.get_rank() == 0:
                 debug_print = True
         else:
             debug_print = True
+        debug_print = self.config.get('debug_print', False)
         # =================
         
         response_length = micro_batch['responses'].size(-1)
 
         assert 'score_ids' in micro_batch, "Error: score_ids missing from micro_batch. Did you update compute_rm_score?"
-        
+
         # ================== 1. PRM 模型推理 (保持不变) ==================
         with torch.no_grad(), torch.autocast(device_type='cuda', dtype=torch.bfloat16):
             input_ids = micro_batch['input_ids']

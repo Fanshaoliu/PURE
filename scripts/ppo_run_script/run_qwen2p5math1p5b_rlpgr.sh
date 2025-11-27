@@ -24,7 +24,7 @@ python -m verl.trainer.main_ppo \
     reward_model.forward_max_token_len_per_gpu=32000 \
     actor_rollout_ref.rollout.max_model_len=4096 \
     actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=32000 \
-    actor_rollout_ref.rollout.gpu_memory_utilization=0.7 \
+    actor_rollout_ref.rollout.gpu_memory_utilization=0.4 \
     actor_rollout_ref.rollout.max_num_batched_tokens=64000 \
     actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
     actor_rollout_ref.rollout.enable_chunked_prefill=True \
