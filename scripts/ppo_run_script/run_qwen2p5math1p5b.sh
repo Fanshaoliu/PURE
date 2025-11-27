@@ -5,6 +5,7 @@
 # export VLLM_ATTENTION_BACKEND=TORCH_SDPA
 export WANDB_API_KEY="f4964340b710e6450355ca2bd2b2f29de3d86312"
 export CUDA_VISIBLE_DEVICES=4,5,6,7
+export HF_ENDPOINT=https://hf-mirror.com
 
 # Inside your container / shell
 export RAY_DISABLE_DASHBOARD=1      # don't start the dashboard
