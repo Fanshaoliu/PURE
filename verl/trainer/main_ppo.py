@@ -39,6 +39,10 @@ def run_ppo(config, compute_score=None):
                     "CUDA_LAUNCH_BLOCKING": "1",
                 }
             },
+            _system_config={
+                "local_fs_capacity_threshold": 0.99  # 将报警阈值改为 99%
+                # "local_fs_capacity_threshold": 1.0 # 或者设为 1.0 完全关闭这个检查
+            },
             # debug mode
             local_mode=config.trainer.get('debug_mode', False),
             # 关键：设置全局日志级别为FATAL（仅保留致命错误）

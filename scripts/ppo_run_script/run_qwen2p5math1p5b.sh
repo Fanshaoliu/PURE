@@ -23,7 +23,12 @@ python -m verl.trainer.main_ppo \
     critic.ppo_max_token_len_per_gpu=4500 \
     reward_model.forward_max_token_len_per_gpu=4500 \
     trainer.n_gpus_per_node=4 \
-    trainer.experiment_name='RLPgR_${actor_rollout_ref.model.path}_prompts-${data.train_batch_size}_n-${actor_rollout_ref.rollout.n}' \
+    +reward_model.use_progress_aggregation=False \
+    +reward_model.progress_agg_method='min' \
+    +reward_model.min_step_size=2 \
+    +reward_model.max_progress=5 \
+    +reward_model.debug_print=False \
+    trainer.experiment_name='PURE-${reward_model.type}_${actor_rollout_ref.model.path}_prompts-${data.train_batch_size}_n-${actor_rollout_ref.rollout.n}' \
     2>&1 | tee training_log/pure_qwen2p5math1p5b.log
 
 

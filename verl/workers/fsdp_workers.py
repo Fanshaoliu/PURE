@@ -1475,7 +1475,7 @@ class ProcessRewardModelWorker(Worker):
         import torch.distributed as dist
         # === Debug 开关 ===
         # 建议只在 rank 0 打印，且只打印少量数据
-        debug_print = self.config.actor.get('debug_print', False)
+        debug_print = self.config.get('debug_print', False)
         if dist.is_initialized():
             if dist.get_rank() == 0:
                 debug_print = True
@@ -1485,6 +1485,8 @@ class ProcessRewardModelWorker(Worker):
         
         response_length = micro_batch['responses'].size(-1)
 
+        assert 'score_ids' in micro_batch, "Error: score_ids missing from micro_batch. Did you update compute_rm_score?"
+        
         # ================== 1. PRM 模型推理 (保持不变) ==================
         with torch.no_grad(), torch.autocast(device_type='cuda', dtype=torch.bfloat16):
             input_ids = micro_batch['input_ids']
@@ -1548,11 +1550,11 @@ class ProcessRewardModelWorker(Worker):
         # ================== 3. Progress Step 聚合与随机切分 (新增逻辑) ==================
         # 检查是否需要进行 Progress Step 聚合
         # 假设 config 中添加了相关配置
-        use_progress_aggregation = self.config.actor.get('use_progress_aggregation', False)
-        progress_agg_method = self.config.actor.get('progress_agg_method', 'min')
+        use_progress_aggregation = self.config.get('use_progress_aggregation', False)
+        progress_agg_method = self.config.get('progress_agg_method', 'min')
         # 随机切分参数
-        MIN_STEP_SIZE = self.config.actor.get('min_step_size', 2)  # 每个 Progress 至少包含的原子步数
-        MAX_PROGRESS = self.config.actor.get('max_progress', 5)    # 最大 Progress 数量
+        MIN_STEP_SIZE = self.config.get('min_step_size', 2)  # 每个 Progress 至少包含的原子步数
+        MAX_PROGRESS = self.config.get('max_progress', 5)    # 最大 Progress 数量
         # 用于Debug的变量
         debug_score_ids = None
         debug_generated_indices = None
@@ -1713,8 +1715,14 @@ class ProcessRewardModelWorker(Worker):
         data.union(self._split_steps(data))
         prm_data = self._build_inputs_for_prm(data)
         prm_data = prm_data.to('cuda')
-        prm_data.union(data.select(batch_keys=['reward_mask', 'responses']))
+
         
+        # === 【修改点】在这里把 'score_ids' 加进去 ===
+        # 原始代码: batch_keys=['reward_mask', 'responses']
+        # prm_data.union(data.select(batch_keys=['reward_mask', 'responses']))
+        # 修改后:
+        prm_data.union(data.select(batch_keys=['reward_mask', 'responses', 'score_ids']))
+
         with self.ulysses_sharding_manager:
             prm_data = self.ulysses_sharding_manager.preprocess_data(data=prm_data)
 
