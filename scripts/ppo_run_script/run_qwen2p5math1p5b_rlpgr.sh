@@ -24,10 +24,11 @@ python -m verl.trainer.main_ppo \
     reward_model.forward_max_token_len_per_gpu=32000 \
     actor_rollout_ref.rollout.max_model_len=4096 \
     actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=32000 \
-    actor_rollout_ref.rollout.gpu_memory_utilization=0.4 \
-    actor_rollout_ref.rollout.max_num_batched_tokens=64000 \
+    actor_rollout_ref.rollout.gpu_memory_utilization=0.5 \
+    actor_rollout_ref.rollout.max_num_batched_tokens=8192 \
     actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
-    actor_rollout_ref.rollout.enable_chunked_prefill=True \
+    actor_rollout_ref.rollout.enable_chunked_prefill=False \
+    actor_rollout_ref.rollout.enforce_eager=True \
     reward_model.type=prm \
     reward_model.credit_assignment=0.1 \
     +reward_model.use_progress_aggregation=True \
