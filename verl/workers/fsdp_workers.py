@@ -47,6 +47,8 @@ from verl.utils.import_utils import import_external_libs
 from verl.utils.model import compute_position_id_with_mask
 from verl.workers.sharding_manager.fsdp_ulysses import FSDPUlyssesShardingManager
 
+from .rubric_generator import generate_progress_rubric
+
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv('VERL_PPO_LOGGING_LEVEL', 'WARN'))
 
@@ -1473,21 +1475,19 @@ class ProcessRewardModelWorker(Worker):
         )
 
         import torch.distributed as dist
-        # === Debug 开关 ===
-        # 建议只在 rank 0 打印，且只打印少量数据
-        if dist.is_initialized():
-            if dist.get_rank() == 0:
-                debug_print = True
-        else:
-            debug_print = True
-        debug_print = self.config.get('debug_print', False)
-        # =================
-        
+        import torch
+
+        # === Debug 开关：只在 rank 0 打印 ===
+        debug_print = bool(self.config.get('debug_print', False))
+        if debug_print and dist.is_initialized() and dist.get_rank() != 0:
+            debug_print = False
+        # ================================
+
         response_length = micro_batch['responses'].size(-1)
 
         assert 'score_ids' in micro_batch, "Error: score_ids missing from micro_batch. Did you update compute_rm_score?"
 
-        # ================== 1. PRM 模型推理 (保持不变) ==================
+        # ================== 1. PRM 模型推理 ==================
         with torch.no_grad(), torch.autocast(device_type='cuda', dtype=torch.bfloat16):
             input_ids = micro_batch['input_ids']
             batch, seqlen = input_ids.shape
@@ -1547,79 +1547,41 @@ class ProcessRewardModelWorker(Worker):
         # [Debug] 保存一份聚合前的原始分数用于对比
         raw_rm_score_debug = rm_score.clone() if debug_print else None
 
-        # ================== 3. Progress Step 聚合与随机切分 (新增逻辑) ==================
-        # 检查是否需要进行 Progress Step 聚合
-        # 假设 config 中添加了相关配置
-        use_progress_aggregation = self.config.get('use_progress_aggregation', False)
+        # ================== 3. Progress Step 聚合 / 切分 ==================
+        use_progress_aggregation = bool(self.config.get('use_progress_aggregation', False))
         progress_agg_method = self.config.get('progress_agg_method', 'min')
-        # 随机切分参数
-        MIN_STEP_SIZE = self.config.get('min_step_size', 2)  # 每个 Progress 至少包含的原子步数
-        MAX_PROGRESS = self.config.get('max_progress', 5)    # 最大 Progress 数量
-        # 用于Debug的变量
+        use_progress_rubric = self.config.get('use_progress_rubric', False)
+
+        score_ids = micro_batch['score_ids']
+        progress_indices = None
         debug_score_ids = None
         debug_generated_indices = None
-        
+
         if use_progress_aggregation:
-            score_ids = micro_batch['score_ids']
-            debug_score_ids = score_ids # 记录用于打印
+            debug_score_ids = score_ids
 
-            # Case A: 数据中自带了分组信息
-            if 'progress_step_indices' in micro_batch:
+            # ---------- 分支 1：micro_batch 自带 progress_step_indices ----------
+            if 'progress_step_indices' in micro_batch and micro_batch['progress_step_indices'] is not None:
                 progress_indices = micro_batch['progress_step_indices']
-            # Case B: 数据中没有分组信息 -> 执行随机切分
+
+            # ---------- 分支 2：没有自带，但 use_progress_rubric = True ----------
+            elif use_progress_rubric:
+                # 这里会根据 rubric 动态构造 progress_indices
+                progress_indices = self._build_progress_indices_from_rubric(micro_batch)
+
+                # rubric 失败（全部非法 / 没有边界） -> 退回随机划分
+                if progress_indices is None:
+                    progress_indices, debug_generated_indices = self._build_random_progress_indices_from_score_ids(
+                        score_ids=score_ids,
+                    )
+
+            # ---------- 分支 3：纯随机划分 ----------
             else:
-                batch_size = score_ids.size(0)
-                generated_indices_list = []
-                max_len = 0
-                
-                for b in range(batch_size):
-                    # 1. 计算当前样本的总步数 (score_ids != -1 的数量)
-                    valid_steps_count = (score_ids[b] != -1).sum().item()
-                    
-                    # 2. 确定切分逻辑
-                    p_indices = []
-                    if valid_steps_count < MIN_STEP_SIZE:
-                        # 步数太少，无法切分，直接作为一个整体
-                        p_indices = [valid_steps_count]
-                    else:
-                        # 计算最大允许切成几段
-                        max_partitions = min(MAX_PROGRESS, valid_steps_count // MIN_STEP_SIZE)
-                        if max_partitions < 1:
-                            p_indices = [valid_steps_count]
-                        else:
-                            # 随机决定切成 k 段
-                            k = torch.randint(1, max_partitions + 1, (1,)).item()
-                            
-                            current_step = 0
-                            steps_remaining = valid_steps_count
-                            
-                            # 生成前 k-1 个切点
-                            for i in range(k - 1):
-                                # 剩余的空间必须足够剩下的 partitions 分配
-                                # max_step_for_this = steps_remaining - (remaining_partitions * min_size)
-                                max_step_size = steps_remaining - (k - 1 - i) * MIN_STEP_SIZE
-                                
-                                # 在 [2, max_step_size] 之间随机选一个长度
-                                step_size = torch.randint(MIN_STEP_SIZE, max_step_size + 1, (1,)).item()
-                                
-                                current_step += step_size
-                                p_indices.append(current_step)
-                                steps_remaining -= step_size
-                            
-                            # 最后一个切点一定是总步数
-                            p_indices.append(valid_steps_count)
-                    
-                    generated_indices_list.append(p_indices)
-                    max_len = max(max_len, len(p_indices))
-                
-                debug_generated_indices = generated_indices_list # 记录用于打印
+                progress_indices, debug_generated_indices = self._build_random_progress_indices_from_score_ids(
+                    score_ids=score_ids,
+                )
 
-                # 3. 构建 Tensor 并 Padding (填0，因为 logical index 是 1-based，0表示无效)
-                progress_indices = torch.zeros((batch_size, max_len), dtype=torch.long, device=rm_score.device)
-                for b, idx_list in enumerate(generated_indices_list):
-                    progress_indices[b, :len(idx_list)] = torch.tensor(idx_list, device=rm_score.device)
-
-            # 执行聚合：计算 Progress Reward 并重置 reward_mask
+            # 执行聚合：根据 progress_indices 把原子步骤聚合成 Progress 级别 reward
             rm_score, reward_mask = self._aggregate_progress_rewards(
                 rm_score, 
                 reward_mask, 
@@ -1629,6 +1591,7 @@ class ProcessRewardModelWorker(Worker):
             )
 
         # ================== 4. Approximate Min-Form Credit Assignment ==================
+        debug_weight = None
         if not self.disable_approx_min_form_credit_assignment:
             # 注意：此时 reward_mask 已经被 _aggregate_progress_rewards 稀疏化了
             # 只有在 Progress Step 的边界处为 True，因此 Softmax 只会在这些节点间分配权重
@@ -1638,7 +1601,7 @@ class ProcessRewardModelWorker(Worker):
                 ) / self.temperature,
                 dim=-1,
             )
-            debug_weight = weight if debug_print else None # 记录用于打印
+            debug_weight = weight if debug_print and use_progress_aggregation else None
             rm_score *= weight
 
         # ================== [DEBUG PRINT BLOCK] ==================
@@ -1657,8 +1620,7 @@ class ProcessRewardModelWorker(Worker):
                 
                 if debug_generated_indices:
                     partitions = debug_generated_indices[b]
-                    print(f"[Sample 0] Random Partitions (Logical Indices): {partitions}")
-                    # 计算每段长度
+                    print(f"[Sample 0] Random Partitions (Logical Indices, 1-based cumulative): {partitions}")
                     lengths = []
                     prev = 0
                     for p in partitions:
@@ -1666,9 +1628,11 @@ class ProcessRewardModelWorker(Worker):
                         prev = p
                     print(f"[Sample 0] Segment Lengths: {lengths}")
 
-            # 2. 打印分数对比
-            if raw_rm_score_debug is not None:
-                # 提取原始原子步骤分数
+            if raw_rm_score_debug is not None and debug_score_ids is not None:
+                import numpy as np
+
+                valid_locs = debug_score_ids[b]
+                valid_locs = valid_locs[valid_locs != -1]
                 raw_step_scores = raw_rm_score_debug[b, valid_locs].detach().float().cpu().numpy()
                 print(f"[Sample 0] Raw Step Scores ({len(raw_step_scores)}):")
                 print(f"   {['{:.4f}'.format(x) for x in raw_step_scores]}")
@@ -1702,8 +1666,306 @@ class ProcessRewardModelWorker(Worker):
 
         return rm_score
 
+    def _decode_student_steps_for_one_sample(self,
+                                         response_tokens,  # shape: [resp_len]
+                                         score_ids_1d,     # shape: [max_num_steps]
+                                         tokenizer):
+        """
+        严格按照 _split_steps 的定义，用 score_ids 来切 step。
+        返回: List[str] student_steps，长度 = 有效步数 = (score_ids_1d != -1).sum()
+        """
+        import torch
+
+        # 有效 step 的结束位置（token 下标）
+        valid_mask = (score_ids_1d != -1)
+        if not torch.any(valid_mask):
+            return []
+
+        step_ends = score_ids_1d[valid_mask]          # e.g. tensor([3, 7, 12])
+        step_ends, _ = torch.sort(step_ends)          # 理论上本来就有序，保险起见再 sort 一下
+
+        steps = []
+        start = 0
+        for end in step_ends:
+            end = int(end.item())
+            if end < start:
+                # 万一 score_ids 异常，直接跳过，避免负切片
+                continue
+            tokens = response_tokens[start:end + 1]   # 包含 end
+            text = tokenizer.decode(
+                tokens.detach().cpu().tolist(),
+                skip_special_tokens=True,
+            ).strip()
+            steps.append(text)
+            start = end + 1
+
+        return steps
+
+    def _map_rubric_to_step_boundaries(self,
+                                       progress_items,
+                                       student_steps):
+        """
+        输入:
+        progress_items: generate_progress_rubric 返回的 JSON array (list[dict])
+                        其中 "Included Steps" 是从 1 开始的 step 序号 (int 或可转成 int 的字符串)
+        student_steps:  List[str]，来自 _decode_student_steps_for_one_sample
+
+        输出:
+        boundaries: List[int]，1-based 累积 step index，例如 [3, 7, 10]
+
+        说明:
+        - 完全在分支处做，不写进 generate_progress_rubric。
+        - 一个 step 最多属于一个 progress，用全局指针防止复用。
+        """
+        boundaries = []
+        num_steps = len(student_steps)
+        if num_steps == 0:
+            return boundaries
+
+        # 1-based：已经分配到的最大 step index
+        global_used_upto = 0
+
+        for item in progress_items:
+            if not isinstance(item, dict):
+                continue
+            included = item.get("Included Steps", [])
+            if not isinstance(included, list):
+                continue
+
+            max_idx_for_progress = 0
+
+            for step_idx in included:
+                # 支持 int 或 "3" 这种字符串
+                if isinstance(step_idx, int):
+                    idx = step_idx
+                elif isinstance(step_idx, str):
+                    s = step_idx.strip()
+                    if not s.isdigit():
+                        continue
+                    idx = int(s)
+                else:
+                    continue
+
+                # 保证合法范围，且不复用已经分配过的 step
+                if 1 <= idx <= num_steps and idx > global_used_upto:
+                    if idx > max_idx_for_progress:
+                        max_idx_for_progress = idx
+                    global_used_upto = idx
+
+            if max_idx_for_progress > 0:
+                # 已经是 1-based
+                boundaries.append(max_idx_for_progress)
+
+        # 去重 + 排序，确保合法
+        boundaries = sorted(
+            set(b for b in boundaries if 1 <= b <= num_steps)
+        )
+        return boundaries
+
+    def _build_progress_indices_from_rubric(self, micro_batch):
+        """
+        rubric 分支：完全在这里做所有额外逻辑：
+
+        1. 用 score_ids 切每个样本的 student_steps
+        2. 调 generate_progress_rubric(prompt_text, student_steps) 拿 JSON array
+        3. 用 _map_rubric_to_step_boundaries 得到 boundaries
+        4. 失败则退回随机划分
+        5. 拼成 progress_step_indices tensor 返回（可包装成 DataProto）
+        """
+
+        if not getattr(self, "use_progress_rubric", False):
+            return None
+
+        tokenizer = self.tokenizer
+
+        required_keys = ["prompts", "responses", "attention_mask", "score_ids"]
+        if not all(k in micro_batch for k in required_keys):
+            print("[Rubric] micro_batch missing required keys, skip rubric.")
+            return None
+
+        prompts = micro_batch["prompts"]          # [B, prompt_len]
+        responses = micro_batch["responses"]      # [B, resp_len]
+        attn_mask = micro_batch["attention_mask"] # [B, prompt_len + resp_len] or similar
+        score_ids = micro_batch["score_ids"]      # [B, max_num_steps]
+
+        batch_size = prompts.size(0)
+        device = prompts.device
+
+        min_step_size = self.config.get("min_step_size", 2)
+        max_progress = self.config.get("max_progress", 5)
+
+        progress_idx_list = []
+        max_len = 0
+
+        # prompt_text 这边简单 decode 整个 prompts（也可以用 mask 精细点）
+        for i in range(batch_size):
+            prompt_ids = prompts[i]
+            prompt_text = tokenizer.decode(
+                prompt_ids.detach().cpu().tolist(),
+                skip_special_tokens=True,
+            )
+
+            resp_tokens = responses[i]
+            score_ids_i = score_ids[i]
+
+            # 1) 用 score_ids_i 切 steps
+            student_steps = self._decode_student_steps_for_one_sample(
+                resp_tokens,
+                score_ids_i,
+                tokenizer,
+            )
+
+            valid_steps_count = len(student_steps)
+            if valid_steps_count == 0:
+                progress_idx_list.append([])
+                continue
+
+            # 2) 调 LLM，拿 JSON array
+            progress_items = generate_progress_rubric(
+                prompt_text=prompt_text,
+                student_steps=student_steps,
+            )
+
+            # 3) rubric → boundaries
+            boundaries = []
+            if progress_items:
+                boundaries = self._map_rubric_to_step_boundaries(
+                    progress_items,
+                    student_steps,
+                )
+
+            # 4) 如果 rubric 不靠谱，就退回随机划分
+            if (not boundaries) and valid_steps_count > 0:
+                boundaries = self._sample_random_progress_boundaries(
+                    valid_steps_count=valid_steps_count,
+                    min_step_size=min_step_size,
+                    max_progress=max_progress,
+                )
+
+            progress_idx_list.append(boundaries)
+            max_len = max(max_len, len(boundaries))
+
+        if max_len == 0:
+            return None
+
+        progress_indices = torch.zeros(
+            (batch_size, max_len),
+            dtype=torch.long,
+            device=device,
+        )
+
+        for i, boundaries in enumerate(progress_idx_list):
+            if boundaries:
+                progress_indices[i, :len(boundaries)] = torch.tensor(
+                    boundaries,
+                    dtype=torch.long,
+                    device=device,
+                )
+
+        # 看你习惯：要么直接返回 tensor，要么包一层 DataProto
+        # 你之前是 DataProto.from_dict(tensors={'progress_step_indices': ...})
+        return DataProto.from_dict(tensors={"progress_step_indices": progress_indices})
+
+    # ---------------------------------------------------------------------------
+
+    def _sample_random_progress_boundaries(self, valid_steps_count: int,
+                                        min_step_size: int, max_progress: int) -> list[int]:
+        """
+        对单个样本，根据原子步数量随机生成 Progress 边界（1-based 累积步数）。
+        例如 valid_steps_count=10, 返回 [3, 6, 10]。
+        """
+        import torch
+
+        if valid_steps_count <= 0:
+            return []
+
+        # 步数太少，直接作为一个整体
+        if valid_steps_count <= min_step_size:
+            return [valid_steps_count]
+
+        # 最大可以切成多少段
+        max_partitions = min(max_progress, valid_steps_count // min_step_size)
+        if max_partitions <= 1:
+            return [valid_steps_count]
+
+        # 随机选择实际段数 k
+        k = int(torch.randint(1, max_partitions + 1, (1,)).item())
+        if k == 1:
+            return [valid_steps_count]
+
+        boundaries: list[int] = []
+        current_step = 0
+        steps_remaining = valid_steps_count
+
+        for i in range(k - 1):
+            # 剩余空间必须保证每个剩余段至少 min_step_size
+            max_step_size = steps_remaining - (k - 1 - i) * min_step_size
+            step_size = int(torch.randint(min_step_size, max_step_size + 1, (1,)).item())
+
+            current_step += step_size
+            boundaries.append(current_step)
+            steps_remaining -= step_size
+
+        boundaries.append(valid_steps_count)
+        return boundaries
+
+
+    def _build_random_progress_indices_from_score_ids(self, score_ids):
+        """
+        batch 级别的随机切分：
+        输入: score_ids [B, max_steps]，-1 表示无效。
+        输出:
+            progress_indices [B, L] (1-based 累积步数, 0 为 padding),
+            generated_indices_list: Python 列表，用于 Debug。
+        """
+        import torch
+
+        min_step_size = self.config.get('min_step_size', 2)
+        max_progress = self.config.get('max_progress', 5)
+
+        batch_size = score_ids.size(0)
+        device = score_ids.device
+
+        generated_indices_list = []
+        max_len = 0
+
+        for b in range(batch_size):
+            valid_steps_count = int((score_ids[b] != -1).sum().item())
+            boundaries = self._sample_random_progress_boundaries(
+                valid_steps_count=valid_steps_count,
+                min_step_size=min_step_size,
+                max_progress=max_progress,
+            )
+            generated_indices_list.append(boundaries)
+            max_len = max(max_len, len(boundaries))
+
+        if max_len == 0:
+            progress_indices = torch.zeros(
+                (batch_size, 0),
+                dtype=torch.long,
+                device=device,
+            )
+            return progress_indices, generated_indices_list
+
+        progress_indices = torch.zeros(
+            (batch_size, max_len),
+            dtype=torch.long,
+            device=device,
+        )
+
+        for b, boundaries in enumerate(generated_indices_list):
+            if boundaries:
+                progress_indices[b, :len(boundaries)] = torch.tensor(
+                    boundaries,
+                    dtype=torch.long,
+                    device=device,
+                )
+
+        return progress_indices, generated_indices_list
+
+    # ---------------------------------------------------------------------------
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
-    def compute_rm_score(self, data:DataProto):
+    def compute_rm_score(self, data: DataProto):
         import itertools
 
         from verl.utils.seqlen_balancing import get_reverse_idx, rearrange_micro_batches
@@ -1712,16 +1974,17 @@ class ProcessRewardModelWorker(Worker):
         if self._is_offload_param:
             load_fsdp_model_to_gpu(self.process_reward_module)
 
+        # 1. 拆分出 score_ids 等原子步信息
         data.union(self._split_steps(data))
+
+        # 2. 构建 PRM 输入
         prm_data = self._build_inputs_for_prm(data)
         prm_data = prm_data.to('cuda')
 
-        
-        # === 【修改点】在这里把 'score_ids' 加进去 ===
-        # 原始代码: batch_keys=['reward_mask', 'responses']
-        # prm_data.union(data.select(batch_keys=['reward_mask', 'responses']))
-        # 修改后:
-        prm_data.union(data.select(batch_keys=['reward_mask', 'responses', 'score_ids']))
+        # 把 reward_mask / responses / score_ids / prompts 也并入 PRM batch
+        prm_data.union(
+            data.select(batch_keys=['reward_mask', 'responses', 'score_ids', 'prompts'])
+        )
 
         with self.ulysses_sharding_manager:
             prm_data = self.ulysses_sharding_manager.preprocess_data(data=prm_data)
@@ -1735,13 +1998,13 @@ class ProcessRewardModelWorker(Worker):
                 micro_batches, indices = rearrange_micro_batches(batch=batch, max_token_len=max_token_len)
             else:
                 micro_batches = batch.split(self.config.micro_batch_size_per_gpu)
-            
+
             output = []
             for micro_batch in micro_batches:
                 rm_score = self._forward_micro_batch(micro_batch)
                 output.append(rm_score)
             token_level_scores = torch.cat(output, dim=0)
-            
+
             if use_dynamic_bsz:
                 indices = list(itertools.chain.from_iterable(indices))
                 assert len(indices) == token_level_scores.size(0), f"{len(indices)} vs. {token_level_scores.size()}"
