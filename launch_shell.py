@@ -120,6 +120,7 @@ def main():
                 if launch_program(args.command, gpu_indices):
                     break
             else:
+                print(f"空闲阈值: 利用率<{args.util_threshold}% 且 显存<{args.mem_threshold}%")
                 print(f"[{time.ctime()}] 所选GPU未全部空闲，{args.interval} 秒后再次检查...")
                 time.sleep(args.interval)
 

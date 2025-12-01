@@ -3,9 +3,10 @@
 # ================= 配置区域 (修改这里即可) =================
 # 实验基础设置
 MODEL_PATH="Qwen/Qwen2.5-Math-1.5B"
-EXP_NAME_PREFIX="PURE"
-GPUS="0,1,2,3"
-# WandB (建议后续移至环境变量文件)
+EXP_NAME_PREFIX="RLPgR-random_progress"
+GPUS="3,5,6,7"
+
+# WandB
 WANDB_KEY="f4964340b710e6450355ca2bd2b2f29de3d86312"
 
 # 关键超参数
@@ -13,7 +14,7 @@ MAX_PROMPT_LEN=1024
 MAX_RESPONSE_LEN=3072
 ROLLOUT_MAX_MODEL_LEN=8192
 BATCH_SIZE=8192 # max_num_batched_tokens
-GPU_MEM_UTIL=0.4
+GPU_MEM_UTIL=0.3
 
 # ================= 环境与系统设置 =================
 export CUDA_VISIBLE_DEVICES=$GPUS
@@ -74,7 +75,7 @@ while [ $COUNT -le $MAX_RETRIES ]; do
         trainer.n_gpus_per_node=$GPU_COUNT \
         trainer.save_freq=10 \
         +reward_model.use_progress_rubric=False \
-        +reward_model.use_progress_aggregation=False \
+        +reward_model.use_progress_aggregation=True \
         +reward_model.progress_agg_method='min' \
         +reward_model.min_step_size=2 \
         +reward_model.max_progress=5 \
@@ -108,4 +109,5 @@ while [ $COUNT -le $MAX_RETRIES ]; do
     # fi
 done
 
-# python launch_shell.py --gpus '0,1,2,3' --command 'sh scripts/ppo_run_script/run_qwen2p5math1p5b.sh' --interval 1 --util-threshold 80 --mem-threshold 80
+
+# python launch_shell.py --gpus '4,5,6,7' --command 'sh scripts/ppo_run_script/run_qwen2p5math1p5b_rlpgr.sh' --interval 1 --util-threshold 80 --mem-threshold 80
