@@ -1542,6 +1542,7 @@ class ProcessRewardModelWorker(Worker):
         rm_score = rm_score[:, -response_length:]
         rm_score = rm_score.softmax(dim=-1)
         # PURE 基础打分: (P_correct - P_incorrect)
+        ##### reward_mask只在每一步结尾处以及 EOS 处为 True，其他位置为 False，代码见def _split_steps #####
         rm_score = (rm_score[..., 1] - rm_score[..., 0]) * reward_mask  # (batch_size, seq_len)
 
         # [Debug] 保存一份聚合前的原始分数用于对比
@@ -1552,6 +1553,8 @@ class ProcessRewardModelWorker(Worker):
         progress_agg_method = self.config.get('progress_agg_method', 'min')
         use_progress_rubric = self.config.get('use_progress_rubric', False)
 
+        ##### score_ids装的是每个response的分数的index，分数只会出现在step末尾，其实score_id给的就是step末尾的位置，以及eos的位置 #####
+        ##### 显然，不同response的step数不一样，对于step少的，就在最后补-1 #####
         score_ids = micro_batch['score_ids']
         progress_indices = None
         debug_score_ids = None
@@ -2093,6 +2096,7 @@ class ProcessRewardModelWorker(Worker):
                 # 5. 将聚合分数写回张量
                 # 我们将其放置在当前 Progress Step 的**最后一个原子 Step** 的物理位置
                 # 这样保持了时序的因果性
+                #### 为什么要end_step_idx - 1，因为end_step_idx是从1开始计数的 ####
                 last_step_physical_idx = valid_step_locs[end_step_idx - 1]
                 
                 new_rm_score[b, last_step_physical_idx] = agg_score

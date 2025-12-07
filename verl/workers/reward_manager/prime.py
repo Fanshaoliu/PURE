@@ -95,10 +95,11 @@ class PrimeRewardManager:
     The Reward Manager used in https://github.com/PRIME-RL/PRIME
     """
 
-    def __init__(self, tokenizer, num_examine, compute_score=None) -> None:
+    def __init__(self, tokenizer, num_examine, compute_score=None, verification_ratio=1.0) -> None:
         self.tokenizer = tokenizer
         self.num_examine = num_examine  # the number of batches of decoded responses to print to the console
         self.compute_score = compute_score or _default_compute_score
+        self.verification_ratio = verification_ratio
 
     def __call__(self, data: DataProto):
         """We will expand this function gradually based on the available datasets"""
@@ -135,6 +136,35 @@ class PrimeRewardManager:
             scores = [0. for _ in range(len(sequences_str))]
         
         scores = torch.tensor(scores, dtype=torch.float32, device=prompt_ids.device)
+
+        # === 修改 2: 插入基于 Index 的 Mask 逻辑 ===
+        # 只有当 ratio < 1.0 时才执行，节省计算
+        if self.verification_ratio < 1.0:
+            # 尝试从 data 中提取 index
+            # 根据 math_dataset.py，index 存储在 extra_info['index'] 中
+            indices = []
+            for item in data:
+                # 兼容性处理：防止某些数据没有 index
+                idx = item.non_tensor_batch.get('extra_info', {}).get('index', -1)
+                indices.append(idx)
+            
+            indices_tensor = torch.tensor(indices, device=scores.device, dtype=torch.long)
+            
+            # 逻辑：保留 index % 100 < ratio * 100 的数据
+            # 例如 ratio=0.1: 保留 0, 100, 200... 以及 1, 101, 201... 到 9, 109...
+            # 这等效于保留了 10% 的数据，且是确定性的
+            # 如果 idx 为 -1 (未找到)，默认 Mask 掉或者保留，这里选择 Mask 掉以防万一
+            
+            mod_value = 100
+            threshold = self.verification_ratio * mod_value
+            
+            # 生成 Mask: True 表示保留 VR，False 表示 Mask (置0)
+            # 只有 index >= 0 且 满足比例要求 才保留
+            keep_mask = (indices_tensor >= 0) & ((indices_tensor % mod_value) < threshold)
+            
+            # 将不满足条件的分数置为 0 (即没有结果监督信号)
+            scores = scores * keep_mask.float()
+        # ==========================================
 
         # repeat punishment: if repeatness > 0.2, get 0 VR
         repeat_mask = data.batch.get('repeat_mask', None)

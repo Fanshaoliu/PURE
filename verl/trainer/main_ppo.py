@@ -144,6 +144,9 @@ def main_task(config, compute_score=None):
         mapping[Role.RewardModel] = global_pool_id
 
     reward_manager_name = config.reward_model.get("reward_manager", "naive")
+
+    verification_ratio = config.reward_model.get("verification_ratio", 1.0)
+
     if reward_manager_name == 'naive':
         from verl.workers.reward_manager import NaiveRewardManager
         reward_manager_cls = NaiveRewardManager
@@ -156,13 +159,24 @@ def main_task(config, compute_score=None):
         reward_manager_cls = BlankRewardManager
     else:
         raise NotImplementedError
-    reward_fn = reward_manager_cls(tokenizer=tokenizer, num_examine=2, compute_score=compute_score)
+    
+    # === 修改开始 ===
+    # 将 verification_ratio 传给构造函数
+    # 注意：我们需要确保 NaiveRewardManager 等其他类也能接收这个参数，或者只针对 Prime 修改
+    # 鉴于你的需求是 PURE (Prime)，我们主要关注 PrimeRewardManager
+    try:
+        reward_fn = reward_manager_cls(tokenizer=tokenizer, num_examine=2, compute_score=compute_score, verification_ratio=verification_ratio)
+    except TypeError:
+        # 兼容处理：如果其他 Manager (如 Naive) 没有这个参数，就回退到旧的调用方式
+        logging.warning(f"{reward_manager_name} does not accept verification_ratio, ignoring it.")
+        reward_fn = reward_manager_cls(tokenizer=tokenizer, num_examine=2, compute_score=compute_score)
+    # === 修改结束 ===
 
     # Note that we always use function-based RM for validation
     if reward_manager_name == 'blank':
-        val_reward_fn = PrimeRewardManager(tokenizer=tokenizer, num_examine=2, compute_score=compute_score)
+        val_reward_fn = PrimeRewardManager(tokenizer=tokenizer, num_examine=2, compute_score=compute_score, verification_ratio=1.0)
     else:
-        val_reward_fn = reward_manager_cls(tokenizer=tokenizer, num_examine=2, compute_score=compute_score)
+        val_reward_fn = reward_manager_cls(tokenizer=tokenizer, num_examine=2, compute_score=compute_score, verification_ratio=1.0)
     
     curriculum_learning_fn = None
     if config.curriculum_learning.get('enable', False):

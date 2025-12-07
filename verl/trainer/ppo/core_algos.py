@@ -78,6 +78,7 @@ def compute_return(token_level_rewards, eos_mask, method='sum', gamma=1.0):
         returns *= eos_mask
     elif method == 'min':
         # TODO: seems have bug
+        # 把末尾的reward设为inf（eos_mask就是attention_mask）
         returns = token_level_rewards.masked_fill(~eos_mask.bool(), torch.inf)
         for col in range(response_length-2, -1, -1):
             returns[:, col] = torch.min(returns[:, col], returns[:, col+1])
@@ -203,6 +204,7 @@ def compute_rloo_outcome_advantage(token_level_rewards: torch.Tensor,
             shape: (bs, response_length)
     """
     response_length = token_level_rewards.shape[-1]
+    # 注意，只有if credit_assignment == 'strict min-form':，下面才会取min，不然就是sum
     returns = compute_return(token_level_rewards, eos_mask, return_aggregate_method)
     advantages = torch.zeros_like(returns)
 
